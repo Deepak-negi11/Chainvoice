@@ -35,6 +35,21 @@ import {
   isInvoicePayable,
   sumBaseUnits,
 } from "@/utils/chainInvoice";
+import {
+  TX_OPERATION,
+  TX_STATUS,
+  findPendingPaymentTx,
+  getVisiblePaymentTxs,
+  isFinalTxStatus,
+  loadPaymentTxs,
+  reconcileOpenPaymentTxs,
+  removePaymentTx,
+  sendTrackedTx,
+  createRecordChainProvider,
+  createWarnOnce,
+  txExplorerUrl,
+  waitForPaymentTx,
+} from "@/utils/paymentTxRecovery";
 import { useTranslation } from "@/hooks/useTranslation";
 import InvoiceVerificationChip from "@/components/InvoiceVerificationChip";
 import {
@@ -98,6 +113,9 @@ const columns = [
   { id: "date", label: "Date", minWidth: 100, sortable: true },
   { id: "actions", label: "Actions", minWidth: 150, sortable: false },
 ];
+
+// How often submitted payment transactions are rechecked while any is pending.
+const PAYMENT_TX_POLL_MS = 15000;
 
 
 
@@ -172,6 +190,18 @@ function ReceivedInvoice() {
   const [batchLoading, setBatchLoading] = useState(false);
   const singlePaymentInFlight = Object.values(paymentLoading).some(Boolean);
   const [batchSuggestions, setBatchSuggestions] = useState([]);
+
+  // Submitted payment transactions for this wallet and network, persisted so a
+  // pending payment is still shown after a refresh (see paymentTxRecovery).
+  const [paymentTxs, setPaymentTxs] = useState([]);
+  const [paymentTxsVersion, setPaymentTxsVersion] = useState(0);
+  const [paymentTxPollTick, setPaymentTxPollTick] = useState(0);
+  const bumpPaymentTxs = () => setPaymentTxsVersion((v) => v + 1);
+  // Invoice ids belong to one deployment, so payment records are matched to
+  // the contract this build uses on the current chain.
+  const paymentContract = chainId
+    ? import.meta.env[`VITE_CONTRACT_ADDRESS_${chainId}`]
+    : undefined;
 
   // Identifies the list on screen, so a payment handler can tell whether the
   // user paged (or switched wallet/network) while its transaction was pending.
@@ -467,6 +497,32 @@ function ReceivedInvoice() {
     toast.success(`Selected ${invoiceIds.length} invoices for batch payment`);
   };
 
+  // One warning per visit, however many steps of a payment fail to save.
+  const notifyNotRecordedRef = useRef(null);
+  if (!notifyNotRecordedRef.current) {
+    notifyNotRecordedRef.current = createWarnOnce(() =>
+      toast(tReceivedInvoices("paymentTx.notRecorded"))
+    );
+  }
+  const notifyNotRecorded = notifyNotRecordedRef.current;
+
+  // Sends a transaction (e.g. () => contract.payInvoice(...)) and records its
+  // hash the moment the wallet returns it, before ethers has fetched the full
+  // transaction from the node (see sendTrackedTx).
+  const sendAndTrack = (signer, context, send) =>
+    sendTrackedTx(
+      signer,
+      { ...context, onNotRecorded: notifyNotRecorded },
+      send
+    ).finally(bumpPaymentTxs);
+
+  // Waits on a sent transaction like tx.wait(), storing its outcome, and
+  // treats a sped-up copy that succeeded as success (see waitForPaymentTx).
+  const waitAndTrack = (tx, context) =>
+    waitForPaymentTx(tx, { ...context, onNotRecorded: notifyNotRecorded }).finally(
+      bumpPaymentTxs
+    );
+
   // UNIFORM INDIVIDUAL PAYMENT
   const payInvoice = async (invoice) => {
     const invoiceId = invoice.id;
@@ -484,6 +540,25 @@ function ReceivedInvoice() {
       toast.error(tReceivedInvoices("waitForBatch"));
       return;
     }
+
+    // A payment the node still holds, e.g. sent before a refresh, would make
+    // this one revert once it confirms, after spending gas.
+    if (
+      findPendingPaymentTx(
+        loadPaymentTxs(chainId, address),
+        invoiceId,
+        paymentContract
+      )
+    ) {
+      toast.error(tReceivedInvoices("paymentTx.alreadyPending"));
+      return;
+    }
+    const txScope = {
+      chainId,
+      account: address,
+      contractAddress: paymentContract,
+      invoiceIds: [invoiceId],
+    };
 
     // Captured before the transaction so the result can be matched against
     // the list that is on screen when it resolves.
@@ -564,33 +639,56 @@ function ReceivedInvoice() {
 
         if (currentAllowance < amountDue) {
           toast(`Requesting approval for ${tokenSymbol}...`);
-          const approveTx = await tokenContract.approve(
-            contractAddress,
-            amountDue
+          const approveTx = await sendAndTrack(
+            signer,
+            { ...txScope, operation: TX_OPERATION.APPROVE, tokenAddress },
+            () => tokenContract.approve(contractAddress, amountDue)
           );
           toast("Approval transaction submitted. Please wait...");
-          await approveTx.wait();
+          await waitAndTrack(approveTx, {
+            ...txScope,
+            operation: TX_OPERATION.APPROVE,
+            tokenAddress,
+          });
           toast.success(`${tokenSymbol} approval completed successfully!`);
         }
 
         toast("Submitting payment transaction...");
-        const tx = await contract.payInvoice(BigInt(invoiceId), {
-          value: paymentValue,
-        });
+        const tx = await sendAndTrack(
+          signer,
+          { ...txScope, operation: TX_OPERATION.PAY, tokenAddress },
+          () =>
+            contract.payInvoice(BigInt(invoiceId), {
+              value: paymentValue,
+            })
+        );
         toast(
           "Payment transaction submitted. Please wait for confirmation..."
         );
-        await tx.wait();
+        await waitAndTrack(tx, {
+          ...txScope,
+          operation: TX_OPERATION.PAY,
+          tokenAddress,
+        });
         toast.success(`Payment successful! Paid with ${tokenSymbol}`);
       } else {
         toast("Submitting payment transaction...");
-        const tx = await contract.payInvoice(BigInt(invoiceId), {
-          value: paymentValue,
-        });
+        const tx = await sendAndTrack(
+          signer,
+          { ...txScope, operation: TX_OPERATION.PAY, tokenAddress },
+          () =>
+            contract.payInvoice(BigInt(invoiceId), {
+              value: paymentValue,
+            })
+        );
         toast(
           "Payment transaction submitted. Please wait for confirmation..."
         );
-        await tx.wait();
+        await waitAndTrack(tx, {
+          ...txScope,
+          operation: TX_OPERATION.PAY,
+          tokenAddress,
+        });
         toast.success(`Payment successful! Paid with ${nativeSymbol}`);
       }
 
@@ -639,6 +737,17 @@ function ReceivedInvoice() {
 
     if (singlePaymentInFlight) {
       toast.error(tReceivedInvoices("waitForPayment"));
+      return;
+    }
+
+    // The contract reverts the whole batch if any one invoice gets paid first.
+    const storedTxs = loadPaymentTxs(chainId, address);
+    if (
+      payableSelected.some((inv) =>
+        findPendingPaymentTx(storedTxs, inv.id, paymentContract)
+      )
+    ) {
+      toast.error(tReceivedInvoices("paymentTx.alreadyPending"));
       return;
     }
 
@@ -723,6 +832,13 @@ function ReceivedInvoice() {
 
         const totalFee = BigInt(feePerInvoice) * BigInt(invoiceIds.length);
         const isNativeToken = tokenAddress === ethers.ZeroAddress;
+        const txScope = {
+          chainId,
+          account: address,
+          contractAddress: paymentContract,
+          invoiceIds,
+          tokenAddress,
+        };
 
         if (!isNativeToken) {
           const tokenContract = new Contract(tokenAddress, ERC20_ABI, signer);
@@ -741,27 +857,44 @@ function ReceivedInvoice() {
 
           if (currentAllowance < totalBaseUnits) {
             toast(`Approving ${symbol} for spending...`);
-            const approveTx = await tokenContract.approve(
-              contractAddress,
-              totalBaseUnits
+            const approveTx = await sendAndTrack(
+              signer,
+              { ...txScope, operation: TX_OPERATION.APPROVE },
+              () => tokenContract.approve(contractAddress, totalBaseUnits)
             );
-            await approveTx.wait();
+            await waitAndTrack(approveTx, {
+              ...txScope,
+              operation: TX_OPERATION.APPROVE,
+            });
             toast.success(`${symbol} approved successfully!`);
           }
 
-          const tx = await contract.payInvoicesBatch(invoiceIds, {
-            value: totalFee,
+          const tx = await sendAndTrack(
+            signer,
+            { ...txScope, operation: TX_OPERATION.PAY_BATCH },
+            () => contract.payInvoicesBatch(invoiceIds, { value: totalFee })
+          );
+          await waitAndTrack(tx, {
+            ...txScope,
+            operation: TX_OPERATION.PAY_BATCH,
           });
-          await tx.wait();
           paidCount += invoices.length;
           toast.success(
             `Successfully paid ${invoices.length} invoices with ${symbol}!`
           );
         } else {
-          const tx = await contract.payInvoicesBatch(invoiceIds, {
-            value: totalBaseUnits + totalFee,
+          const tx = await sendAndTrack(
+            signer,
+            { ...txScope, operation: TX_OPERATION.PAY_BATCH },
+            () =>
+              contract.payInvoicesBatch(invoiceIds, {
+                value: totalBaseUnits + totalFee,
+              })
+          );
+          await waitAndTrack(tx, {
+            ...txScope,
+            operation: TX_OPERATION.PAY_BATCH,
           });
-          await tx.wait();
           paidCount += invoices.length;
           toast.success(
             `Successfully paid ${invoices.length} invoices with ${nativeSymbol}!`
@@ -797,6 +930,69 @@ function ReceivedInvoice() {
   useEffect(() => {
     setShowWalletAlert(!isConnected);
   }, [isConnected]);
+
+  useEffect(() => {
+    setPaymentTxs(address && chainId ? loadPaymentTxs(chainId, address) : []);
+  }, [address, chainId, paymentTxsVersion]);
+
+  // Recheck submitted transactions that have no final outcome yet, on load
+  // and after every payment attempt, then every PAYMENT_TX_POLL_MS while any
+  // is still pending (unresolved ones wait for the next load or refresh). Records are scoped to this chain, and the wallet client must
+  // be on it too: it can lag a network switch, and asking another chain about
+  // a hash would make every transaction look lost.
+  useEffect(() => {
+    if (!walletClient || !address || !chainId) return;
+    if (walletClient.chain?.id !== Number(chainId)) return;
+
+    const hasOpen = loadPaymentTxs(chainId, address).some(
+      (record) => !isFinalTxStatus(record.status)
+    );
+    if (!hasOpen) return;
+
+    let cancelled = false;
+    let timer;
+
+    const reconcile = async () => {
+      const provider = createRecordChainProvider(walletClient, chainId);
+      let result;
+      try {
+        result = await reconcileOpenPaymentTxs(
+          chainId,
+          address,
+          provider,
+          undefined,
+          undefined,
+          () => cancelled
+        );
+      } finally {
+        provider.destroy();
+      }
+      if (!result) return;
+      const { settled, stillOpen } = result;
+      setPaymentTxsVersion((v) => v + 1);
+      // The invoice table reads paid status from the contract, so it is
+      // refetched once a transaction has an outcome.
+      if (settled) setRefreshTrigger((p) => p + 1);
+      if (stillOpen) {
+        timer = setTimeout(
+          () => setPaymentTxPollTick((t) => t + 1),
+          PAYMENT_TX_POLL_MS
+        );
+      }
+    };
+
+    reconcile();
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [walletClient, address, chainId, refreshTrigger, paymentTxPollTick]);
+
+  const dismissPaymentTx = (hash) => {
+    removePaymentTx(chainId, address, hash);
+    bumpPaymentTxs();
+  };
 
   // A new wallet or network invalidates the loaded page outright. Declared
   // before the fetch effect so nothing downstream can read invoices belonging
@@ -1163,6 +1359,12 @@ function ReceivedInvoice() {
 
   const formatDate = formatInvoiceDate;
 
+  const visiblePaymentTxs = getVisiblePaymentTxs(paymentTxs, paymentContract);
+  const hasOpenPaymentTx = visiblePaymentTxs.some(
+    (record) => !isFinalTxStatus(record.status)
+  );
+  const paymentTxChain = getWagmiChainInfo(chainId);
+
   const unpaidInvoices = filteredAndSortedInvoices.filter(isInvoicePayable);
   const selectedCount = payableSelected.length;
   const grouped = getGroupedInvoices(payableSelected);
@@ -1320,6 +1522,60 @@ function ReceivedInvoice() {
           {isConnected && keysError && keysErrorCode !== "KEY_MISMATCH" && (
             <Alert severity="error" sx={{ mb: 2 }}>
               {keysError}
+            </Alert>
+          )}
+
+          {/* Payment transactions sent from this browser that are still
+              open or did not go through. Confirmed ones need no banner: the
+              table shows the invoice as paid, read from the contract. */}
+          {isConnected && visiblePaymentTxs.length > 0 && (
+            <Alert
+              severity={hasOpenPaymentTx ? "info" : "warning"}
+              sx={{ mb: 2 }}
+            >
+              <Typography variant="body2" sx={{ fontWeight: 600, mb: 0.5 }}>
+                {tReceivedInvoices("paymentTx.title")}
+              </Typography>
+              <ul className="space-y-1">
+                {visiblePaymentTxs.map((record) => {
+                  const explorerUrl = txExplorerUrl(paymentTxChain, record.hash);
+                  const shortHash = `${record.hash.slice(0, 10)}…${record.hash.slice(-6)}`;
+                  return (
+                    <li
+                      key={record.hash}
+                      className="flex flex-wrap items-center gap-x-2 gap-y-1"
+                    >
+                      <span>
+                        {tReceivedInvoices(`paymentTx.operation.${record.operation}`, {
+                          ids: record.invoiceIds.map((id) => `#${id}`).join(", "),
+                        })}
+                        {": "}
+                        {tReceivedInvoices(`paymentTx.status.${record.status}`)}
+                      </span>
+                      {explorerUrl ? (
+                        <a
+                          href={explorerUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="font-mono underline"
+                        >
+                          {shortHash}
+                        </a>
+                      ) : (
+                        <span className="font-mono">{shortHash}</span>
+                      )}
+                      {record.status !== TX_STATUS.PENDING && (
+                        <Button
+                          size="small"
+                          onClick={() => dismissPaymentTx(record.hash)}
+                        >
+                          {tReceivedInvoices("paymentTx.dismiss")}
+                        </Button>
+                      )}
+                    </li>
+                  );
+                })}
+              </ul>
             </Alert>
           )}
 
@@ -1898,7 +2154,15 @@ function ReceivedInvoice() {
                                     size="small"
                                     onClick={() => payInvoice(invoice)}
                                     disabled={
-                                      paymentLoading[invoice.id] || batchLoading
+                                      paymentLoading[invoice.id] ||
+                                      batchLoading ||
+                                      Boolean(
+                                        findPendingPaymentTx(
+                                          paymentTxs,
+                                          invoice.id,
+                                          paymentContract
+                                        )
+                                      )
                                     }
                                     sx={{
                                       bgcolor: paymentLoading[invoice.id]
@@ -1926,7 +2190,13 @@ function ReceivedInvoice() {
                                   >
                                     {paymentLoading[invoice.id]
                                       ? "Processing..."
-                                      : "Pay Now"}
+                                      : findPendingPaymentTx(
+                                            paymentTxs,
+                                            invoice.id,
+                                            paymentContract
+                                          )
+                                        ? tReceivedInvoices("paymentTx.pendingButton")
+                                        : "Pay Now"}
                                   </Button>
                                 )}
                                 {invoice.isCancelled && (

@@ -60,7 +60,25 @@
     },
     "waitForBatch": "Wait for the batch payment to finish.",
     "waitForPayment": "Wait for the current payment to finish.",
-    "batchPartlyPaid": "Paid {{paid}} of {{total}} invoices, then the {{symbol}} payment failed. Check error details for more information."
+    "batchPartlyPaid": "Paid {{paid}} of {{total}} invoices, then the {{symbol}} payment failed. Check error details for more information.",
+    "paymentTx": {
+      "title": "Payment transactions from this browser",
+      "operation": {
+        "approve": "Token approval for invoice {{ids}}",
+        "pay": "Payment for invoice {{ids}}",
+        "payBatch": "Batch payment for invoices {{ids}}"
+      },
+      "status": {
+        "pending": "pending, waiting for confirmation.",
+        "unresolved": "status unknown. The network no longer reports this transaction and it may have been dropped. Check the explorer before paying again.",
+        "reverted": "failed on-chain. This transaction moved no funds.",
+        "replaced": "replaced by another transaction from your wallet (sped up or cancelled). The table shows whether the invoice was paid."
+      },
+      "dismiss": "Dismiss",
+      "alreadyPending": "A payment for this invoice is still pending. Wait for it to confirm before paying again.",
+      "pendingButton": "Payment pending",
+      "notRecorded": "This transaction could not be saved in this browser, so it will not be shown again after a refresh. Check your wallet before paying again."
+    }
   },
   "tokenPicker": {
     "testnetNotice": "Select the native coin or use Input Custom Token for testnet ERC-20 tokens.",
